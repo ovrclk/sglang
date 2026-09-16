@@ -36,9 +36,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
-        self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
-            re.DOTALL,
+        self.tool_call_parameter_regex = re.compile(r"<parameter=([^<>]*)>")
+        self.parameter_token_regex = re.compile(
+            r"""<parameter=([^<>]*)>|</parameter>|</function>|["'\\]"""
         )
 
         # Streaming State
@@ -57,6 +57,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self.current_param_names: set[str] = set()
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -175,6 +176,105 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
+    def _parse_parameter_value(
+        self,
+        text: str,
+        start: int,
+        param_name: str,
+        param_config: dict,
+        *,
+        final: bool = False,
+    ) -> Optional[tuple[str, int]]:
+        """Scan one value, returning its text and the next unconsumed position.
+
+        Repair repeated openers only in structured arguments, outside quoted
+        strings. Plain strings keep literal same-name openers. Closing tags are
+        hard boundaries even for malformed values with an unterminated quote.
+        Scanning ordered tokens and joining retained spans once avoids repeated
+        suffix searches and buffer splices when a model repeats many tags.
+        """
+        param_type = self._get_param_type(param_config.get(param_name))
+        structured = param_type in ("object", "array", "arr") or param_type.startswith(
+            ("dict", "list")
+        )
+        quote = None
+        quoted_next_param = None
+        escaped_until = start
+        parts = []
+        part_start = start
+        repeated = 0
+        end = len(text)
+        next_pos = end
+        for match in self.parameter_token_regex.finditer(text, start):
+            token = match.group()
+            if token in (self.parameter_end_token, self.function_end_token):
+                end = match.start()
+                next_pos = match.end() if token == self.parameter_end_token else end
+                break
+            if structured:
+                if match.start() < escaped_until:
+                    continue
+                if quote is not None:
+                    if token == "\\":
+                        escaped_until = match.end() + 1
+                    elif token == quote[0] and text.startswith(quote, match.start()):
+                        escaped_until = match.start() + len(quote)
+                        quote = None
+                        quoted_next_param = None
+                    elif (
+                        match.group(1) is not None
+                        and match.group(1) != param_name
+                        and quoted_next_param is None
+                    ):
+                        quoted_next_param = match.start()
+                    continue
+                if token in ('"', "'"):
+                    # The conversion fallback also accepts Python literals.
+                    quote = (
+                        token * 3
+                        if text.startswith(token * 3, match.start())
+                        else token
+                    )
+                    escaped_until = match.start() + len(quote)
+                    continue
+            next_name = match.group(1)
+            if next_name is None:
+                continue
+            if next_name != param_name:
+                end = next_pos = match.start()
+                break
+            if structured:
+                parts.append(text[part_start : match.start()])
+                part_start = match.end()
+                repeated += 1
+        else:
+            if not final:
+                return None
+
+        # An unterminated string must not swallow the next distinct parameter.
+        # A closed string, however, owns any literal opening tags inside it.
+        if quote is not None and quoted_next_param is not None:
+            end = next_pos = quoted_next_param
+        parts.append(text[part_start:end])
+        if repeated:
+            logger.warning(
+                "Removed %d repeated opening tag(s) for parameter '%s'.",
+                repeated,
+                param_name,
+            )
+        return "".join(parts), next_pos
+
+    def _extract_parameters(self, text: str, param_config: dict):
+        pos = 0
+        while match := self.tool_call_parameter_regex.search(text, pos):
+            name = match.group(1)
+            value, pos = self._parse_parameter_value(
+                text, match.end(), name, param_config, final=True
+            )
+            yield name, value
+            if text.startswith(self.function_end_token, pos):
+                break
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
         if self.tool_call_start_token not in text:
@@ -206,12 +306,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_config = self._get_arguments_config(func_name, tools)
                     parsed_params = {}
 
-                    for p_match in self.tool_call_parameter_regex.findall(params_str):
-                        if ">" not in p_match:
+                    for p_name, p_val in self._extract_parameters(
+                        params_str, param_config
+                    ):
+                        if p_name in parsed_params:
+                            logger.warning(
+                                "Duplicate parameter '%s' in tool '%s'; keeping the first occurrence.",
+                                p_name,
+                                func_name,
+                            )
                             continue
-                        p_idx = p_match.index(">")
-                        p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :]
                         # Remove prefixing and trailing \n
                         if p_val.startswith("\n"):
                             p_val = p_val[1:]
@@ -287,6 +391,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     self.current_tool_param_count = 0
                     self.json_started = False
                     self.current_func_name = func_name
+                    self.current_param_names.clear()
 
                     calls.append(
                         ToolCallItem(
@@ -308,37 +413,24 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if current_slice.startswith(self.parameter_prefix):
                 name_end = current_slice.find(">")
                 if name_end != -1:
-                    value_start_idx = name_end + 1
-                    rest_of_slice = current_slice[value_start_idx:]
-
-                    # A parameter can end in multiple ways:
-                    # 1. [Normal] Encounter </parameter>
-                    # 2. [Abnormal] Encounter next <parameter=
-                    # 3. [Abnormal] Encounter </function>
-                    # So we need to find the smallest one as the parameter end position.
-                    cand_end_param = rest_of_slice.find(self.parameter_end_token)
-                    cand_next_param = rest_of_slice.find(self.parameter_prefix)
-                    cand_end_func = rest_of_slice.find(self.function_end_token)
-
-                    candidates = []
-                    if cand_end_param != -1:
-                        candidates.append(
-                            (cand_end_param, len(self.parameter_end_token))
-                        )
-                    if cand_next_param != -1:
-                        candidates.append((cand_next_param, 0))
-                    if cand_end_func != -1:
-                        candidates.append((cand_end_func, 0))
-
-                    if candidates:
-                        best_cand = min(candidates, key=lambda x: x[0])
-                        end_pos = best_cand[0]
-                        end_token_len = best_cand[1]
-
-                        param_name = current_slice[
-                            len(self.parameter_prefix) : name_end
-                        ]
-                        raw_value = rest_of_slice[:end_pos]
+                    param_name = current_slice[len(self.parameter_prefix) : name_end]
+                    param_config = self._get_arguments_config(
+                        self.current_func_name, tools
+                    )
+                    parsed_value = self._parse_parameter_value(
+                        current_slice, name_end + 1, param_name, param_config
+                    )
+                    if parsed_value is not None:
+                        raw_value, next_pos = parsed_value
+                        self.parsed_pos += next_pos
+                        if param_name in self.current_param_names:
+                            logger.warning(
+                                "Duplicate parameter '%s' in tool '%s'; keeping the first occurrence.",
+                                param_name,
+                                self.current_func_name,
+                            )
+                            continue
+                        self.current_param_names.add(param_name)
 
                         # Cleanup value
                         if raw_value.startswith("\n"):
@@ -355,9 +447,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             )
                             self.json_started = True
 
-                        param_config = self._get_arguments_config(
-                            self.current_func_name, tools
-                        )
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
@@ -378,9 +467,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         )
                         self.current_tool_param_count += 1
 
-                        # Advance cursor
-                        total_len = (name_end + 1) + end_pos + end_token_len
-                        self.parsed_pos += total_len
                         continue
 
                 # Incomplete parameter tag or value
